@@ -12,14 +12,13 @@
 #include "DIO.h"
 #include "T1.h"
 #include "matlabfiles.h"
-//#include <time.h>
-//#include "emulate.h"
 #include "MyRio1900.h"
 #include <stdint.h>
 #include <math.h>
 
 /* prototypes */
 void wait(void);
+
 /* definitions */
 #define PRINT_PIN 1
 #define PRINT_INDEX 0
@@ -31,7 +30,7 @@ void wait(void);
 #define PWM_INDEX 1
 
 // define approximate wait time interval
-const double wait_dur = (1.0/667.0)*0.000001*834017.0; // wait delay in seconds
+const double wait_dur = (1.0/667.0)*0.000001*2085014.0; // wait delay in seconds
 
 
 // declare button pins
@@ -67,7 +66,9 @@ static int clk;
 
 // declare outputs
 static int run; // PWM output state
-//static int buffer; // declare buffer list for plotting data
+#define IMAX 200              // max points
+static  double buffer[IMAX];  // speed buffer
+static  double *bp = buffer;  // buffer pointer
 
 // declare user inputs
 static int N; // number of low motor periods in a BTI
@@ -124,6 +125,10 @@ void speed(void){
 	double RPM = increment_velocity*(60.0)*(1.0/2048.0);
 	printf_lcd("\fSpeed: %f RPM",RPM);
 	printf("RPM: %.2f (rotations/minute)\n",RPM);
+	// add RPM to buffer list
+	if (bp < buffer + IMAX){
+		*bp++ = RPM;
+	}
 	curr_state = LOW_S;
 }
 
@@ -134,6 +139,14 @@ void stop(void){
 }
 
 void exit_func(void){
+	// save data to file
+	if (bp!=buffer){
+		int *err;
+		int mf = openmatfile("Lab4.mat", &err);
+		if(!mf) printf("Can't open mat file %d\n", err);
+		matfile_addmatrix(mf, "Velocity", buffer, IMAX, 1, 0);
+		matfile_close(mf);
+	}
 	printf("Stopped the program.\n");
 }
 
