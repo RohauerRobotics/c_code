@@ -16,13 +16,11 @@
 #include "NiFpga_MyRio1900Fpga60.h"
 #include "DIIRQ.h"
 #include "TimerIRQ.h"
+#include "matlabfiles.h"
 #include <pthread.h>
 
 // saturation function
 #define SATURATE(x,lo,hi) ((x)<(lo)?(lo):(x)>(hi)?(hi):(x))
-/* prototypes */
-
-/* definitions */
 
 // globally declared thread resource structure
 typedef struct {
@@ -43,14 +41,25 @@ double cascade(double x_in, struct biquad *fa, int n_s, double y_min, double y_m
 	struct biquad *p;
 	p = fa;
 	double y_n;
-	int i;
-	for(i=0;i<n_s;i++){
-		y_n = ((p->b0*x_in)+(p->b1*p->x1)+(p->b2*p->x2)-(p->a1*p->y1)-(p->a2*p->y2))/(p->a0);
+	int c_i;
+	y_n = x_in;
+	for(c_i=0;c_i<n_s;c_i++){
+//		printf("b0: %f \n", p->b0);
+//		printf("a0 %f\n", p->a0);
+		p->x0 = y_n;
+//		printf("x0: %f\n",p->x0);
+		y_n = ((p->b0*p->x0)+(p->b1*p->x1)+(p->b2*p->x2)-(p->a1*p->y1)-(p->a2*p->y2))/(p->a0);
 		// shuffle values forward
 		p->x2 = p->x1;
-		p->x1 = x_in;
+		p->x1 = p->x0;
 		p->y2 = p->y1;
 		p->y1 = y_n;
+		// on last run through set y1 to saturated value
+		// for voltage protection
+		if (c_i==n_s-1){
+			p->y1 = SATURATE(y_n,y_min,y_max);
+			y_n = SATURATE(y_n,y_min,y_max);
+		}
 		// increment biquad
 		p++;
 	}
@@ -59,7 +68,14 @@ double cascade(double x_in, struct biquad *fa, int n_s, double y_min, double y_m
 
 // global variables
 NiFpga_Session myrio_session;
-int32_t timeoutValue = 500000;
+static const int32_t timeoutValue = 500;
+
+// buffer variable
+#define IMAX 1000              // max points
+static  double out_buffer[IMAX];  // speed buffer
+static  double *out_bp = out_buffer;  // buffer pointer
+static  double in_buffer[IMAX];  // speed buffer
+static  double *in_bp = in_buffer;  // buffer pointer
 
 
 void* Timer_ISR(void*thread_resource){
@@ -71,9 +87,24 @@ void* Timer_ISR(void*thread_resource){
 	// define a biquad representing the discretized transfer function
 	int myFilter_ns = 2; // number of biquad sections
 	static struct biquad myFilter[] = {
-			{1.000e+00,9.999e-01,0.0000e00,1.000e+00,-9.8177e-01,0.0000e+00,0,0,0,0,0},
-			{2.1878e-04,4.3755e-04,2.1878e-04,1.0000e+00,-1.8674e+00,8.8220e-01,0,0,0,0,0}
+	  {1.0000e+00,  9.9999e-01, 0.0000e+00,
+	   1.0000e+00, -8.8177e-01, 0.0000e+00, 0, 0, 0, 0, 0},
+	  {2.1878e-04,  4.3755e-04, 2.1878e-04,
+	   1.0000e+00, -1.8674e+00, 8.8220e-01, 0, 0, 0, 0, 0}
 	};
+	// ---- initialize analog input and output ----
+	MyRio_Aio AIC0; // input
+	MyRio_Aio AOC1; // output
+//	MyRio_Aio AOC2; // output
+	Aio_InitCI0(&AIC0);
+	Aio_InitCO1(& AOC1);
+
+	// declare static input/output for better processing speed
+	static double x_input;
+	static double y_out;
+	static int count=0;
+	static int saved = 0;
+
 	while(ISR_Resource->irqThreadReady==1){
 		Irq_Wait(ISR_Resource->irqContext,
 					TIMERIRQNO,
@@ -81,8 +112,33 @@ void* Timer_ISR(void*thread_resource){
 					(NiFpga_Bool*) &(ISR_Resource->irqThreadReady));
 		if(irqAssert & (1<<TIMERIRQNO)){
 			// interrupt service code
-			printf("Timer is working!\n");
-			printf_lcd("\fTimer is working!");
+//			printf("Timer is working!\n");
+//			printf_lcd("\fTimer is working!");
+			x_input = Aio_Read(&AIC0);
+//			printf("x_input value: %.2f\n",x_input);
+
+			y_out = cascade(x_input,myFilter,myFilter_ns, -10, 10);
+//			printf("Output Val: %f\n", y_out);
+
+//			printf("y output value: %.2f\n",y_out);
+			Aio_Write(&AOC1, y_out);
+
+			if (in_bp < in_buffer + IMAX){
+				*in_bp++ = x_input;
+				*out_bp++ = y_out;
+				printf("Num Samples: %d\n", count++);
+			}
+			else if (in_bp==in_buffer+ IMAX&& saved==0){
+			    printf("Saving Data.\n");
+			    int *err;
+			    MATFILE *mf;
+			    mf = openmatfile("Sine_200Hz.mat", &err);
+			    if(!mf) printf("Can't open mat file %d\n", err);
+			    matfile_addmatrix(mf, "Input", in_buffer, IMAX, 1, 0);
+			    matfile_addmatrix(mf, "Output", out_buffer, IMAX, 1, 0);
+			    matfile_close(mf);
+			    saved = 1;
+			}
 
 			// set next timer
 			NiFpga_WriteU32(myrio_session, NiFpga_MyRio1900Fpga60_ControlU32_IRQTIMERWRITE,timeoutValue);
@@ -98,6 +154,14 @@ void* Timer_ISR(void*thread_resource){
 	pthread_exit(NULL);
 	return NULL;
 }
+
+void wait_5ms(void){
+	uint32_t count = 417000;
+	while(count>0){
+		count--;
+	}
+}
+
 int main(int argc, char **argv)
 {
 	NiFpga_Status status;
@@ -105,6 +169,9 @@ int main(int argc, char **argv)
     status = MyRio_Open();		    			// open FPGA session
     if (MyRio_IsNotSuccess(status)) return status;
 
+    printf("Saturation Test: SAT(15,-10,10) = %d\n",SATURATE(10,-15,15));
+    printf("Saturation Test: SAT(15,-10,10) = %d\n",SATURATE(-10,-15,15));
+    printf("Saturation Test: SAT(15,-10,10) = %d\n",SATURATE(5,-15,15));
     // Timer Interrupt Setup
     int32_t irq_status;
     MyRio_IrqTimer irqTimer0;
@@ -126,18 +193,35 @@ int main(int argc, char **argv)
     							&irqThread0);
 
     // ------ other main() stuff ------
-    char c;
+    static char c;
+    static int w_i;
     while((c=getkey())!=DEL){
-    	// main loop stuff
+    	// wait 25 ms
+    	for (w_i=0;w_i<3;w_i++){
+    		wait_5ms();
+    	}
     }
 
     // kill thread
+    printf_lcd("\fEnded Program.");
     irqThread0.irqThreadReady = NiFpga_False;
     irq_status = pthread_join(thread, NULL);
     printf("IRQ Status: %d\n", irq_status);
     irq_status = Irq_UnregisterTimerIrq(&irqTimer0,
     						irqThread0.irqContext);
     printf("IRQ Status: %d\n", irq_status);
+
+//    if (&in_bp!=in_buffer){
+//    		printf("Saving Data.\n");
+//    		int *err;
+//    		MATFILE *mf;
+//    		mf = openmatfile("Square_8HZ.mat", &err);
+//    		if(!mf) printf("Can't open mat file %d\n", err);
+////    		matfile_addstring(mf,"name","Dylan");
+//    		matfile_addmatrix(mf, "Input", in_buffer, IMAX, 1, 0);
+//    		matfile_addmatrix(mf, "Output", out_buffer, IMAX, 1, 0);
+//    		matfile_close(mf);
+//    }
 
 
 	status = MyRio_Close();						// close FPGA session
