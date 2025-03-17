@@ -1,9 +1,9 @@
 /*
  * Lab # 7
  * Author: Dylan Rohauer
- * Date: 3/14/25 (Happy Pi Day!)
+ * Date: 3/16/25 (Happy Pi Day!)
  * Description: This is a lab designed to implement a motor speed controller
- * using a digitally implemented proportional - integral controler.
+ * using a digitally implemented proportional - integral controller.
  */
 
 // standard libraries
@@ -33,13 +33,15 @@
 
 // timer delay time
 static int32_t timeout_value = 5000; // 5000 microseconds = 5 ms
-
+static double val_kp = 0.104;
+static double val_ki = 2.07;
+static double val_vref = -200;
 // timer ISR and encoder globals
 NiFpga_Session myrio_session;
 MyRio_Encoder my_encoder;
 
-static uint32_t prev_count;
-static uint32_t curr_count;
+static int32_t prev_count;
+static int32_t curr_count;
 
 // --- global structs ---
 
@@ -59,15 +61,13 @@ struct biquad {
 };
 
 // declare buffer index
-# define BMAX 500
+# define BMAX 2500
 static double meas_vel[BMAX];
 static double *m_v = meas_vel;
 static double out_volt[BMAX];
 static double *o_v = out_volt;
 static double ref_vel;
 static double last_ref;
-static
-
 
 // --- functions ---
 
@@ -109,9 +109,12 @@ double velocity(void){
 	double vel;
 	// get current count
 	curr_count = Encoder_Counter(&my_encoder);
+//	printf("Current Count: %d\n", curr_count);
 	// get calculate velocity from wait time and number of cycles in a BTI
 	vel = (curr_count - prev_count)/(timeout_value*0.000001);
+//	printf("Velocity A: %f\n", vel);
 	vel =  vel*(60.0)*(1.0/2048.0); // convert to RPMs
+//	printf("velocity B: %f\n",vel);
 	// assign prev_count to current count
 	prev_count = curr_count;
 
@@ -127,6 +130,9 @@ void* ISR_TIMER(void*thread_resource){
 
 	// define constant pointers --> dereference to read values
 	double *ref_rpm = &((ISR_Resource->p_table+0)->value); // ref rpm is the first item
+	// Display values
+	double *rpm_measured = &((ISR_Resource->p_table+1)->value); // ref rpm is the first item
+	double *vda_out = &((ISR_Resource->p_table+2)->value); // ref rpm is the first item
 	double *K_P = &((ISR_Resource->p_table+3)->value); // proportional constant
 	double *K_I = &((ISR_Resource->p_table+4)->value); // integral constant
 	double *BTI = &((ISR_Resource->p_table+5)->value); // integral constant
@@ -139,6 +145,7 @@ void* ISR_TIMER(void*thread_resource){
 	Aio_Write(&analog_out, 0);
 
 	// test encoder
+	EncoderC_initialize(myrio_session, &my_encoder);
 	curr_count = Encoder_Counter(&my_encoder);
 	printf("New Encoder Count: %d\n", curr_count);
 	prev_count = curr_count;
@@ -146,23 +153,25 @@ void* ISR_TIMER(void*thread_resource){
 	// define a biquad representing the discretized transfer function
 	int control_ns = 1; // number of biquad sections
 	static struct biquad control_coeffs[] = {
-	  {1.0000e+00,  9.9999e-01, 0.0000e+00,
-	   1.0000e+00, -1.0000e+00, 0.0000e+00,
+	  {1.0000e+00,  0, 0,
+	   1.0000e+00, -1.0000e+00, 0,
 	   0, 0, 0,
 	   0, 0},
 	};
-
+	struct biquad *cc_p = control_coeffs;
 	// update biquad with user inputs (if any)
-	control_coeffs->b0 = (*K_P) + 0.5*(*K_I)*(*BTI);
-	control_coeffs->b1 = -(*K_P) + 0.5*(*K_I)*(*BTI);
+	printf("BTI is: %f\n", (*BTI));
+	cc_p->b0 = (*K_P) + 0.5*(*K_I)*(*BTI)*0.001;
+	cc_p->b1 = -(*K_P) + 0.5*(*K_I)*(*BTI)*0.001;
 
 	// declare current, error, and analog_out value
 	static double curr_rpm;
 	// define current error
 	static double rpm_error;
 	static double analog_value;
-	static double last_rpm = 0.0;
-
+	double last_kp = *K_P;
+	double last_ki = *K_I;
+	static int iter_counts = 0;
 	static int saved = 0;
 	while(ISR_Resource->irqThreadReady==1){
 		Irq_Wait(ISR_Resource->irqContext,
@@ -170,12 +179,18 @@ void* ISR_TIMER(void*thread_resource){
 					&irqAssert,
 					(NiFpga_Bool*) &(ISR_Resource->irqThreadReady));
 		if(irqAssert & (1<<TIMERIRQNO)){
+			if (last_ki!=(*K_I) || last_kp!=(*K_P)){
+							cc_p->b0 = (*K_P) + 0.5*(*K_I)*(*BTI)*0.001;
+							cc_p->b1 = -(*K_P) + 0.5*(*K_I)*(*BTI)*0.001;
+							last_kp = *K_P;
+							last_ki = *K_I;
+			}
 			curr_rpm = velocity();
-			rpm_error = curr_rpm - (*ref_rpm);
-			printf("Ref RPM: %f\n",(*ref_rpm));
-
+			rpm_error = (*ref_rpm) - curr_rpm;
+//			printf("Ref RPM: %f\n",(*ref_rpm));
+//			printf("RPM Error: %f\n", rpm_error);
 			analog_value = cascade(rpm_error,control_coeffs,control_ns, -10, 10);
-//			printf("Output Val: %f\n", y_out);
+//			printf("Output Val: %f\n", analog_value);
 
 //			printf("y output value: %.2f\n",y_out);
 			Aio_Write(&analog_out,analog_value);
@@ -183,12 +198,13 @@ void* ISR_TIMER(void*thread_resource){
 			if (m_v < meas_vel + BMAX){
 				*m_v++ = curr_rpm;
 				*o_v++ = analog_value;
+				iter_counts++;
 			}
 			else if (m_v==meas_vel+ BMAX&& saved==0){
 			    printf("Saving Data.\n");
 			    int *err;
 			    MATFILE *mf;
-			    mf = openmatfile("Motor_Position.mat", &err);
+			    mf = openmatfile("StepChange.mat", &err);
 			    if(!mf) printf("Can't open mat file %d\n", err);
 			    matfile_addmatrix(mf, "Velocity", meas_vel, BMAX, 1, 0);
 			    matfile_addmatrix(mf, "Output", out_volt, BMAX, 1, 0);
@@ -197,6 +213,8 @@ void* ISR_TIMER(void*thread_resource){
 			}
 
 			// set next timer
+			(*vda_out) = analog_value;
+			(*rpm_measured) = curr_rpm;
 			NiFpga_WriteU32(myrio_session, NiFpga_MyRio1900Fpga60_ControlU32_IRQTIMERWRITE,timeout_value);
 			NiFpga_WriteBool(myrio_session, NiFpga_MyRio1900Fpga60_ControlBool_IRQTIMERSETTIME,NiFpga_True);
 			Irq_Acknowledge(irqAssert);
@@ -221,11 +239,11 @@ int main(int argc, char **argv)
     // parameter table definition
     char *prog_title = "PI Control Table";
     table prog_table[] = {
-    		{"V_ref(rpm): ", 1, 0.0}, // V reference velocity in RPM , editable, initial value 0
+    		{"V_ref(rpm): ", 1, val_vref}, // V reference velocity in RPM , editable, initial value 0
     		{"V_J(rpm): ", 0, 0.0}, // inertia velocity, internally determined, init 0
     		{"V_out(mV): ",0,0.0}, // output velocity
-    		{"K_p(Vs/r): ",1,0.0}, // proportional constant
-    		{"K_i(V/r): ",1,0.0}, // integral constant
+    		{"K_p(Vs/r): ",1,val_kp}, // proportional constant
+    		{"K_i(V/r): ",1,val_ki}, // integral constant
     		{"BTI(ms): ",1,0.001*timeout_value} // basic time increment
     };
 
