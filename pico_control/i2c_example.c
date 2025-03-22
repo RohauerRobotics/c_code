@@ -36,6 +36,26 @@ uint16_t read_as5600_angle() {
     return angle;
 }
 
+// Function to calculate angle movement, accounting for rollover
+void calculate_angle_movement(float current_angle) {
+    if (last_angle < 0) {  // Initialize on first read
+        last_angle = current_angle;
+        return;
+    }
+
+    float delta = current_angle - last_angle;
+
+    // Handle rollover cases
+    if (delta > 180.0) {
+        delta -= 360.0;  // Passed 0° clockwise
+    } else if (delta < -180.0) {
+        delta += 360.0;  // Passed 360° counterclockwise
+    }
+
+    total_movement += delta;
+    last_angle = current_angle;
+}
+
 int main() {
     // Initialize stdio (for USB serial output)
     stdio_init_all();
@@ -55,7 +75,8 @@ int main() {
         uint16_t angle = read_as5600_angle();
         // The angle is a raw 12-bit value (0-4095). Optionally convert to degrees:
         float angle_deg = (angle * 360.0f) / 4096.0f;
-        printf("Raw Angle: %4d, Angle: %6.2f°\n", angle, angle_deg);
+        calculate_angle_movement(current_angle);
+        printf("Current Angle: %6.2f° | Total Movement: %6.2f°\n", current_angle, total_movement);
         sleep_ms(100);
     }
 
